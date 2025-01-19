@@ -24,6 +24,11 @@ builder.Services.AddHttpClient("ProductService", client =>
     client.BaseAddress = new Uri(productServiceBaseAddress!);
 });
 
+builder.Services.AddHttpClient("OrderService", client =>
+{
+    var orderServiceBaseAddress = builder.Configuration["OrderService:BaseAddress"];
+    client.BaseAddress = new Uri(orderServiceBaseAddress!);
+});
 
 var app = builder.Build();
 
@@ -101,6 +106,77 @@ app.MapGet("/api/carts", async (CartDbContext dbContext, IHttpClientFactory http
 
     return Results.Ok(result);
 });
+
+app.MapGet("/api/carts/create-order", async (CartDbContext dbContext, IHttpClientFactory httpClientFactory, Guid userId,
+                                       CancellationToken cancellationToken) =>
+{
+    // Kullanýcýnýn sepetini al
+    var cart = await dbContext.Carts
+        .Include(c => c.CartItems)
+        .FirstOrDefaultAsync(c => c.UserId == userId, cancellationToken);
+
+    if (cart == null || !cart.CartItems.Any())
+    {
+        return Results.NotFound("Sepet bulunamadý veya sepet boþ.");
+    }
+
+    // Order servisi için HTTP istemcisi oluþtur
+    var httpClient = httpClientFactory.CreateClient("OrderService");
+    var productHttpClient = httpClientFactory.CreateClient("ProductService");
+
+    // Sipariþ için DTO'yu oluþtur
+    var orderDtoList = new List<object>
+    {
+        new
+        {
+            Items = cart.CartItems.Select(cartItem => new
+            {
+                ProductId = cartItem.ProductId,
+                Quantity = cartItem.Quantity,
+                Price = 0 // Ürün fiyatýný burada belirleyebilirsiniz
+            }).ToList()
+        }
+    };
+
+    // Sipariþ servisine istek at
+    try
+    {
+        var response = await httpClient.PostAsJsonAsync("/create-order", orderDtoList, cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+        {
+
+            // Stok düþme iþlemi
+            foreach (var cartItem in cart.CartItems)
+            {
+                var stockUpdateDto = new
+                {
+                    ProductId = cartItem.ProductId,
+                    Quantity = cartItem.Quantity
+                };
+
+                var stockResponse = await productHttpClient.PostAsJsonAsync("/api/products/update-stock", stockUpdateDto, cancellationToken);
+
+                if (!stockResponse.IsSuccessStatusCode)
+                {
+                    return Results.Problem($"Stok güncellenirken bir hata oluþtu: {stockResponse.ReasonPhrase}");
+                }
+            }
+
+            // Sipariþ baþarýlý, sepeti temizle
+            dbContext.Carts.Remove(cart);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok("Sipariþ oluþturuldu ve sepet temizlendi.");
+        }
+
+        return Results.Problem("Sipariþ oluþturulamadý: " + response.ReasonPhrase);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Sipariþ oluþturulurken bir hata oluþtu: {ex.Message}");
+    }
+});
+
 
 // Migration'larý otomatik olarak uygula
 using (var scope = app.Services.CreateScope())
